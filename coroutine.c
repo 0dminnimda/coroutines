@@ -4,15 +4,39 @@
 #include <stdbool.h>
 #include <string.h>
 
+#if _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <poll.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#endif
 
 #include "coroutine.h"
+
+
+#if _WIN32
+int getpagesize() {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwPageSize;
+}
+#endif
 
 // TODO: make the STACK_CAPACITY customizable by the user
 //#define STACK_CAPACITY (4*1024)
 #define STACK_CAPACITY (1024*getpagesize())
+
+#if _WIN32
+#define GUARD_PAGE_SIZE (STACK_CAPACITY / 256)
+#else
+#define GUARD_PAGE_SIZE 0
+#endif
+
+//                          overflow           stack           underflow
+#define STACK_FULL_SIZE (GUARD_PAGE_SIZE + STACK_CAPACITY + GUARD_PAGE_SIZE)
+#define STACK_OFFSET    (GUARD_PAGE_SIZE + STACK_CAPACITY)
 
 // Initial capacity of a dynamic array
 #ifndef DA_INIT_CAP
@@ -60,7 +84,11 @@ typedef struct {
 } Indices;
 
 typedef struct {
+#if _WIN32
+    char *items;  // not supported yet
+#else
     struct pollfd *items;
+#endif
     size_t count;
     size_t capacity;
 } Polls;
@@ -82,12 +110,33 @@ typedef enum {
     SM_WRITE,
 } Sleep_Mode;
 
-// Linux x86_64 call convention
+// Linux x86_64 calling convention
 // %rdi, %rsi, %rdx, %rcx, %r8, and %r9
+
+// https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions?view=msvc-170#x64-register-usage
+// Windows x64 calling convention: RCX, RDX, R8, R9
+// Windows x64 ABI considers registers RBX, RBP, RDI, RSI, RSP, R12, R13, R14, R15, and XMM6-XMM15 nonvolatile.
+// They must be saved and restored by a function that uses them.
 
 void __attribute__((naked)) coroutine_yield(void)
 {
     // @arch
+#if _WIN32
+    asm(
+    "    pushq %rcx\n"
+    "    pushq %rbx\n"
+    "    pushq %rbp\n"
+    "    pushq %rdi\n"
+    "    pushq %rsi\n"
+    "    pushq %r12\n"
+    "    pushq %r13\n"
+    "    pushq %r14\n"
+    "    pushq %r15\n"
+    // TODO: push XMM6-XMM15
+    "    movq %rsp, %rcx\n"     // rsp
+    "    movq $0, %rdx\n"       // sm = SM_READ
+    "    jmp coroutine_switch_context\n");
+#else
     asm(
     "    pushq %rdi\n"
     "    pushq %rbp\n"
@@ -99,12 +148,30 @@ void __attribute__((naked)) coroutine_yield(void)
     "    movq %rsp, %rdi\n"     // rsp
     "    movq $0, %rsi\n"       // sm = SM_NONE
     "    jmp coroutine_switch_context\n");
+#endif
 }
 
 void __attribute__((naked)) coroutine_sleep_read(int fd)
 {
-    (void) fd;
     // @arch
+#if _WIN32
+    asm(
+    "    pushq %rcx\n"
+    "    pushq %rbx\n"
+    "    pushq %rbp\n"
+    "    pushq %rdi\n"
+    "    pushq %rsi\n"
+    "    pushq %r12\n"
+    "    pushq %r13\n"
+    "    pushq %r14\n"
+    "    pushq %r15\n"
+    // TODO: push XMM6-XMM15
+    "    movq %rcx, %r8\n"      // fd
+    "    movq %rsp, %rcx\n"     // rsp
+    "    movq $1, %rdx\n"       // sm = SM_READ
+    "    jmp coroutine_switch_context\n");
+#else
+    (void) fd;
     asm(
     "    pushq %rdi\n"
     "    pushq %rbp\n"
@@ -117,12 +184,30 @@ void __attribute__((naked)) coroutine_sleep_read(int fd)
     "    movq %rsp, %rdi\n"     // rsp
     "    movq $1, %rsi\n"       // sm = SM_READ
     "    jmp coroutine_switch_context\n");
+#endif
 }
 
 void __attribute__((naked)) coroutine_sleep_write(int fd)
 {
-    (void) fd;
     // @arch
+#if _WIN32
+    asm(
+    "    pushq %rcx\n"
+    "    pushq %rbx\n"
+    "    pushq %rbp\n"
+    "    pushq %rdi\n"
+    "    pushq %rsi\n"
+    "    pushq %r12\n"
+    "    pushq %r13\n"
+    "    pushq %r14\n"
+    "    pushq %r15\n"
+    // TODO: push XMM6-XMM15
+    "    movq %rcx, %r8\n"      // fd
+    "    movq %rsp, %rcx\n"     // rsp
+    "    movq $2, %rdx\n"       // sm = SM_READ
+    "    jmp coroutine_switch_context\n");
+#else
+    (void) fd;
     asm(
     "    pushq %rdi\n"
     "    pushq %rbp\n"
@@ -135,11 +220,27 @@ void __attribute__((naked)) coroutine_sleep_write(int fd)
     "    movq %rsp, %rdi\n"     // rsp
     "    movq $2, %rsi\n"       // sm = SM_WRITE
     "    jmp coroutine_switch_context\n");
+#endif
 }
 
 void __attribute__((naked)) coroutine_restore_context(void *rsp)
 {
     // @arch
+#if _WIN32
+    asm(
+    "    movq %rcx, %rsp\n"
+    // TODO: pop XMM15-XMM6
+    "    popq %r15\n"
+    "    popq %r14\n"
+    "    popq %r13\n"
+    "    popq %r12\n"
+    "    popq %rsi\n"
+    "    popq %rdi\n"
+    "    popq %rbp\n"
+    "    popq %rbx\n"
+    "    popq %rcx\n"
+    "    ret\n");
+#else
     (void)rsp;
     asm(
     "    movq %rdi, %rsp\n"
@@ -151,6 +252,7 @@ void __attribute__((naked)) coroutine_restore_context(void *rsp)
     "    popq %rbp\n"
     "    popq %rdi\n"
     "    ret\n");
+#endif
 }
 
 void coroutine_switch_context(void *rsp, Sleep_Mode sm, int fd)
@@ -160,23 +262,36 @@ void coroutine_switch_context(void *rsp, Sleep_Mode sm, int fd)
     switch (sm) {
     case SM_NONE: current += 1; break;
     case SM_READ: {
+#if _WIN32
+        (void)fd;
+        TODO("polling is not implemented for windows");
+#else
         da_append(&asleep, active.items[current]);
         struct pollfd pfd = {.fd = fd, .events = POLLRDNORM,};
         da_append(&polls, pfd);
         da_remove_unordered(&active, current);
+#endif
     } break;
 
     case SM_WRITE: {
+#if _WIN32
+        (void)fd;
+        TODO("polling is not implemented for windows");
+#else
         da_append(&asleep, active.items[current]);
         struct pollfd pfd = {.fd = fd, .events = POLLWRNORM,};
         da_append(&polls, pfd);
         da_remove_unordered(&active, current);
+#endif
     } break;
 
     default: UNREACHABLE("coroutine_switch_context");
     }
 
     if (polls.count > 0) {
+#if _WIN32
+        TODO("polling is not implemented for windows");
+#else
         int timeout = active.count == 0 ? -1 : 0;
         int result = poll(polls.items, polls.count, timeout);
         if (result < 0) TODO("poll");
@@ -191,6 +306,7 @@ void coroutine_switch_context(void *rsp, Sleep_Mode sm, int fd)
                 ++i;
             }
         }
+#endif
     }
 
     assert(active.count > 0);
@@ -210,7 +326,11 @@ void coroutine_finish(void)
     if (contexts.count == 0) return;
     if (active.items[current] == 0) {
         for (size_t i = 1; i < contexts.count; ++i) {
-            munmap(contexts.items[i].stack_base, STACK_CAPACITY);
+#if _WIN32
+            VirtualFree(contexts.items[i].stack_base, 0, MEM_RELEASE);
+#else
+            munmap(contexts.items[i].stack_base, STACK_FULL_SIZE);
+#endif
         }
         free(contexts.items);
         free(active.items);
@@ -229,6 +349,9 @@ void coroutine_finish(void)
     da_remove_unordered(&active, current);
 
     if (polls.count > 0) {
+#if _WIN32
+        TODO("polling is not implemented for windows");
+#else
         int timeout = active.count == 0 ? -1 : 0;
         int result = poll(polls.items, polls.count, timeout);
         if (result < 0) TODO("poll");
@@ -243,6 +366,7 @@ void coroutine_finish(void)
                 ++i;
             }
         }
+#endif
     }
 
     assert(active.count > 0);
@@ -258,14 +382,34 @@ void coroutine_go(void (*f)(void*), void *arg)
     } else {
         da_append(&contexts, ((Context){0}));
         id = contexts.count-1;
-        contexts.items[id].stack_base = mmap(NULL, STACK_CAPACITY, PROT_WRITE|PROT_READ, MAP_PRIVATE|MAP_STACK|MAP_ANONYMOUS|MAP_GROWSDOWN, -1, 0);
+#if _WIN32
+        void *base = contexts.items[id].stack_base = VirtualAlloc(NULL, STACK_FULL_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        assert(base != NULL);
+        DWORD old_protect;
+        assert(VirtualProtect(       base,                GUARD_PAGE_SIZE, PAGE_NOACCESS, &old_protect));
+        assert(VirtualProtect((char*)base + STACK_OFFSET, GUARD_PAGE_SIZE, PAGE_NOACCESS, &old_protect));
+#else
+        contexts.items[id].stack_base = mmap(NULL, STACK_FULL_SIZE, PROT_WRITE|PROT_READ, MAP_PRIVATE|MAP_STACK|MAP_ANONYMOUS|MAP_GROWSDOWN, -1, 0);
         assert(contexts.items[id].stack_base != MAP_FAILED);
+#endif
     }
 
-    void **rsp = (void**)((char*)contexts.items[id].stack_base + STACK_CAPACITY);
+    void **rsp = (void**)((char*)contexts.items[id].stack_base + STACK_OFFSET);
     // @arch
     *(--rsp) = coroutine_finish;
     *(--rsp) = f;
+#if _WIN32
+    *(--rsp) = arg; // push rcx
+    *(--rsp) = 0;   // push rbx
+    *(--rsp) = 0;   // push rbp
+    *(--rsp) = 0;   // push rdi
+    *(--rsp) = 0;   // push rsi
+    *(--rsp) = 0;   // push r12
+    *(--rsp) = 0;   // push r13
+    *(--rsp) = 0;   // push r14
+    *(--rsp) = 0;   // push r15
+    // TODO: push XMM6-XMM15
+#else
     *(--rsp) = arg; // push rdi
     *(--rsp) = 0;   // push rbx
     *(--rsp) = 0;   // push rbp
@@ -273,6 +417,7 @@ void coroutine_go(void (*f)(void*), void *arg)
     *(--rsp) = 0;   // push r13
     *(--rsp) = 0;   // push r14
     *(--rsp) = 0;   // push r15
+#endif
     contexts.items[id].rsp = rsp;
 
     da_append(&active, id);
